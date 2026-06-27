@@ -1,0 +1,16 @@
+# Node modules
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Environment variables
+.env
+.env.local
+
+# Next.js build output
+client/.next/
+client/out/
+
+# OS generated files
+.DS_Store
+Thumbs.db
