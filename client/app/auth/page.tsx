@@ -15,7 +15,7 @@ export default function AuthPage() {
     const endpoint = isLogin ? '/auth/login' : '/auth/signup';
     
     try {
-      const res = await fetch(`http://localhost:4000${endpoint}`, {
+      const res = await fetch( `${process.env.NEXT_PUBLIC_BACKEND_URL}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData),
