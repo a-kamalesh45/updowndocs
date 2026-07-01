@@ -2,6 +2,7 @@ import { Router } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { pool } from '../db.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -53,6 +54,21 @@ router.post('/login', async (req, res) => {
     
     delete user.password_hash;
     res.json({ user, token });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// The JWT only carries userId (see jwt.sign calls above), not the name
+// the person actually signed up with. Without this route, any page that
+// only has the token (like the document editor) has no way to recover
+// the real name and has to fall back to a generic "User XXXX" placeholder.
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [req.userId]);
+    const user = result.rows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ user });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
