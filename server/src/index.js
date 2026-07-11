@@ -4,8 +4,9 @@ import dotenv from 'dotenv';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import { pool } from './db.js';
-import { initDB } from './db.js';
+import { createClient } from 'redis';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { pool, initDB } from './db.js';
 import authRoutes from './routes/auth.js';
 import documentRoutes from './routes/documents.js';
 import { requireAuth } from './middleware/auth.js';
@@ -15,8 +16,7 @@ dotenv.config();
 const REQUIRED_ENV = ['CLIENT_URL', 'JWT_SECRET'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
 if (missingEnv.length > 0) {
-  console.error(`Missing required environment variable(s): ${missingEnv.join(', ')}`);
-  console.error('Set these in server/.env before starting the server.');
+  console.error(`Missing required env: ${missingEnv.join(', ')}`);
   process.exit(1);
 }
 
@@ -24,25 +24,27 @@ const app = express();
 app.use(cors({ origin: process.env.CLIENT_URL }));
 app.use(express.json());
 
-// 1. Create HTTP server and attach Socket.io
 const httpServer = createServer(app);
-// server/src/index.js
 const io = new Server(httpServer, { cors: { origin: process.env.CLIENT_URL } });
-app.set('io', io); // Attach to Express
-
-
+app.set('io', io);
 
 initDB();
 
 app.use('/auth', authRoutes);
 app.use('/documents', documentRoutes);
 
-app.get('/protected', requireAuth, (req, res) => {
-  res.json({ message: 'You are authenticated!', userId: req.userId });
-});
+// --- IMPROVEMENT C: REDIS PUB/SUB ADAPTER ---
+// This allows your WebSocket server to scale across multiple instances
+const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+const pubClient = createClient({ url: redisUrl });
+const subClient = pubClient.duplicate();
 
-// 2. Authenticate the WebSocket connection
-// This middleware verifies the token during the WebSocket handshake
+Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
+  io.adapter(createAdapter(pubClient, subClient));
+  console.log('Redis Pub/Sub Adapter connected for horizontal scaling');
+}).catch(err => console.error('Redis connection failed (Continuing without scaling):', err.message));
+// --------------------------------------------
+
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
   if (!token) return next(new Error('Authentication error'));
@@ -50,19 +52,11 @@ io.use((socket, next) => {
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) return next(new Error('Authentication error'));
     socket.userId = decoded.userId;
-    // Store expiry so we can re-check it later — jwt.verify only runs once
-    // at handshake time, so without this a socket kept open past the
-    // token's 1-day expiry (e.g. a laptop left open overnight) would keep
-    // emitting yjs-update/awareness-update indefinitely with no further
-    // auth check.
-    socket.tokenExp = decoded.exp; // seconds since epoch
+    socket.tokenExp = decoded.exp; 
     next();
   });
 });
 
-// 3. Handle WebSocket connections and "Rooms"
-// 3. Handle WebSocket connections and "Rooms"
-// 3. Handle WebSocket connections and "Rooms"
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.userId}`);
 
@@ -73,35 +67,39 @@ io.on('connection', (socket) => {
     }
   }, 60_000);
 
-  // STAGE 8: Cache the user's role on room join
   socket.on('join-document', async (documentId) => {
     try {
       const res = await pool.query('SELECT role FROM collaborators WHERE user_id = $1 AND document_id = $2', [socket.userId, documentId]);
       if (res.rows.length > 0) {
         socket.join(documentId);
-        
-        // Save the role directly onto the socket object for fast lookup
         if (!socket.roles) socket.roles = {};
         socket.roles[documentId] = res.rows[0].role;
-        
-        console.log(`User ${socket.userId} joined document ${documentId} as ${socket.roles[documentId]}`);
-      } else {
-        console.log(`Access denied for User ${socket.userId} to ${documentId}`);
+        console.log(`User ${socket.userId} joined ${documentId} as ${socket.roles[documentId]}`);
       }
     } catch (err) {
       console.error('Socket DB Error', err);
     }
   });
 
+  // CRITICAL FIX: The missing WebSocket Relay + Dual-Layer RBAC Enforcement
+  socket.on('yjs-update', ({ documentId, update }) => {
+    // If they are a viewer, silently drop the keystrokes (Network-level RBAC)
+    if (socket.roles && socket.roles[documentId] === 'viewer') return;
+    
+    // Relay the compressed binary delta to everyone else in the room
+    socket.to(documentId).emit('yjs-update', update);
+  });
+
+  socket.on('awareness-update', ({ documentId, update }) => {
+    socket.to(documentId).emit('awareness-update', update);
+  });
 
   socket.on('disconnect', () => {
-    console.log(`User disconnected: ${socket.userId}`);
     clearInterval(expiryCheck);
   });
 });
 
 const PORT = process.env.PORT || 4000;
-// CRITICAL: Listen on the httpServer, not the Express app directly
 httpServer.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });

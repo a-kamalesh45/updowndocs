@@ -9,8 +9,7 @@ import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
 import Placeholder from '@tiptap/extension-placeholder';
 import * as Y from 'yjs';
-import { Awareness } from 'y-protocols/awareness';
-import { WebrtcProvider } from 'y-webrtc'; // <-- The P2P Engine
+import { Awareness, encodeAwarenessUpdate, applyAwarenessUpdate } from 'y-protocols/awareness';
 import { io } from 'socket.io-client';
 
 // Manuscript-editorial palette
@@ -177,15 +176,6 @@ export default function DocumentPage() {
     const token = localStorage.getItem('token');
     if (!token) return router.push('/auth');
 
-    // --- WebRTC Peer-to-Peer Engine ---
-    // This creates a direct browser-to-browser connection for real-time sync.
-    const provider = new WebrtcProvider(`manuscript-${documentId}`, ydoc, { awareness });
-
-    // Monitor P2P Connection Status
-    provider.on('status', (event: any) => {
-      if (event.connected) setSyncStatus('saved');
-    });
-
     // --- Identity Setup ---
     const payload = JSON.parse(atob(token.split('.')[1]));
     const userId = payload.userId;
@@ -211,7 +201,7 @@ export default function DocumentPage() {
       .catch(() => { });
 
     // Instantly catch mid-session role downgrades
-    socket.on('permissions-updated', (data: any) => { 
+    socket.on('permissions-updated', (data: any) => {
       const payload = JSON.parse(atob(token.split('.')[1]));
       if (data.userId === payload.userId) {
         setMyRole(data.newRole);
@@ -235,6 +225,24 @@ export default function DocumentPage() {
 
     fetchVersions();
 
+    // --- WebSocket Relay Listeners ---
+    // 1. Receive document text updates from other users
+    socket.on('yjs-update', (update) => {
+      Y.applyUpdate(ydoc, new Uint8Array(update));
+    });
+
+    // 2. Broadcast your cursor/typing presence to the server
+    awareness.on('update', (changes: any, origin: any) => {
+      if (origin === socket) return;
+      const update = encodeAwarenessUpdate(awareness, changes.added.concat(changes.updated, changes.removed));
+      socket.emit('awareness-update', { documentId, update: Array.from(update) });
+    });
+
+    // 3. Receive other users' cursors/typing presence from the server
+    socket.on('awareness-update', (update) => {
+      applyAwarenessUpdate(awareness, new Uint8Array(update), socket);
+    });
+
     // --- Presence UI Updates ---
     awareness.on('change', () => {
       const entries = Array.from(awareness.getStates().entries());
@@ -254,7 +262,7 @@ export default function DocumentPage() {
       .catch(() => router.push('/dashboard'));
 
     return () => {
-      provider.destroy();
+      socket.disconnect();
       ydoc.destroy();
       awareness.destroy();
     };
