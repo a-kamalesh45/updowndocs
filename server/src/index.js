@@ -12,11 +12,6 @@ import { requireAuth } from './middleware/auth.js';
 
 dotenv.config();
 
-// Fail loudly instead of silently breaking CORS or JWT verification for
-// every client. A missing CLIENT_URL makes cors({ origin: undefined })
-// block all cross-origin requests with no clear error — this is exactly
-// what causes "works for me, broken for my collaborator" reports, since
-// the failure happens per-browser with nothing obvious in server logs.
 const REQUIRED_ENV = ['CLIENT_URL', 'JWT_SECRET'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
 if (missingEnv.length > 0) {
@@ -33,6 +28,7 @@ app.use(express.json());
 const httpServer = createServer(app);
 // server/src/index.js
 const io = new Server(httpServer, { cors: { origin: process.env.CLIENT_URL } });
+app.set('io', io); // Attach to Express
 
 
 
@@ -97,20 +93,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Relay Yjs binary updates (Stage 5)
-  socket.on('yjs-update', ({ documentId, update }) => {
-    // STAGE 8 ENFORCEMENT: Silently drop keystrokes from Viewers
-    if (socket.roles && socket.roles[documentId] === 'viewer') {
-      return; 
-    }
-    socket.to(documentId).emit('yjs-update', update);
-  });
-
-  // Relay cursor and presence updates (Stage 6)
-  socket.on('awareness-update', ({ documentId, update }) => {
-    // Viewers are allowed to broadcast awareness (so you can see them looking at the doc)
-    socket.to(documentId).emit('awareness-update', update);
-  });
 
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.userId}`);

@@ -9,9 +9,11 @@ import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
 import Placeholder from '@tiptap/extension-placeholder';
 import * as Y from 'yjs';
-import { Awareness, encodeAwarenessUpdate, applyAwarenessUpdate } from 'y-protocols/awareness';
+import { Awareness } from 'y-protocols/awareness';
+import { WebrtcProvider } from 'y-webrtc'; // <-- The P2P Engine
 import { io } from 'socket.io-client';
 
+// Manuscript-editorial palette
 const INK = '#1C1B1A';
 const PAPER = '#FAF8F3';
 const PAPER_RAISED = '#FFFFFF';
@@ -24,8 +26,9 @@ export default function DocumentPage() {
   const documentId = params.id as string;
   const router = useRouter();
 
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://192.168.1.10:4000';
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
 
+  // Core CRDT State
   const ydoc = useMemo(() => new Y.Doc(), []);
   const awareness = useMemo(() => new Awareness(ydoc), [ydoc]);
 
@@ -88,19 +91,23 @@ export default function DocumentPage() {
     }
   }, [editor, myRole]);
 
+  // Rest API Cold Storage Fetching & Saving
   const saveDocumentContent = async () => {
     const token = localStorage.getItem('token');
     if (!token) return;
+
+    // Convert highly compressed binary Uint8Array to Base64 for HTTP transport
     const state = Y.encodeStateAsUpdate(ydoc);
+    const base64Update = btoa(String.fromCharCode.apply(null, Array.from(state)));
+
     try {
       await fetch(`${API_URL}/documents/${documentId}`, {
         method: 'PATCH',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: { update: Array.from(state) } })
+        body: JSON.stringify({ content: base64Update })
       });
       setSyncStatus('saved');
     } catch (err) {
-      console.error('Save failed:', err);
       setSyncStatus('offline');
     }
   };
@@ -142,7 +149,6 @@ export default function DocumentPage() {
     } catch (err) { console.error('Failed to restore version', err); }
   };
 
-  // STAGE 8: Handle Share Submission
   const handleShare = async (e: React.FormEvent) => {
     e.preventDefault();
     const token = localStorage.getItem('token');
@@ -152,7 +158,7 @@ export default function DocumentPage() {
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: shareEmail, role: shareRole })
       });
-      
+
       if (res.ok) {
         alert('User invited successfully!');
         setShowShareModal(false);
@@ -166,10 +172,21 @@ export default function DocumentPage() {
     }
   };
 
+  // Main Effect: Network & Identity
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) return router.push('/auth');
 
+    // --- WebRTC Peer-to-Peer Engine ---
+    // This creates a direct browser-to-browser connection for real-time sync.
+    const provider = new WebrtcProvider(`manuscript-${documentId}`, ydoc, { awareness });
+
+    // Monitor P2P Connection Status
+    provider.on('status', (event: any) => {
+      if (event.connected) setSyncStatus('saved');
+    });
+
+    // --- Identity Setup ---
     const payload = JSON.parse(atob(token.split('.')[1]));
     const userId = payload.userId;
 
@@ -177,10 +194,13 @@ export default function DocumentPage() {
     const colorIndex = Array.from(userId).reduce((acc: number, char: any) => acc + char.charCodeAt(0), 0) % userColors.length;
     const myColor = userColors[colorIndex];
 
+    const socket = io(API_URL, { auth: { token } });
+
     let persistentUser = { name: `User ${userId.substring(0, 4)}`, color: myColor };
     setLocalUser(persistentUser);
     awareness.setLocalState({ user: persistentUser, typing: false });
 
+    // Fetch real name
     fetch(`${API_URL}/auth/me`, { headers: { 'Authorization': `Bearer ${token}` } })
       .then(res => res.ok ? res.json() : Promise.reject())
       .then(({ user }) => {
@@ -188,21 +208,23 @@ export default function DocumentPage() {
         setLocalUser(persistentUser);
         awareness.setLocalState({ user: persistentUser, typing: false });
       })
-      .catch(() => {});
+      .catch(() => { });
 
-    const socket = io(API_URL, { auth: { token } });
-
-    socket.on('connect', () => setSyncStatus('saved'));
-    socket.on('disconnect', () => setSyncStatus('offline'));
-
-    socket.on('auth-expired', () => {
-      localStorage.removeItem('token');
-      router.push('/auth');
+    // Instantly catch mid-session role downgrades
+    socket.on('permissions-updated', (data: any) => { 
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      if (data.userId === payload.userId) {
+        setMyRole(data.newRole);
+        if (data.newRole === 'viewer') {
+          editor?.setEditable(false);
+          alert('Your permissions have been downgraded to Viewer.');
+        }
+      }
     });
 
+    // --- Throttled Cold Storage Saving ---
     ydoc.on('update', (update) => {
       socket.emit('yjs-update', { documentId, update });
-
       if (!saveTimeoutRef.current) {
         saveTimeoutRef.current = setTimeout(() => {
           saveDocumentContent();
@@ -213,37 +235,26 @@ export default function DocumentPage() {
 
     fetchVersions();
 
-    socket.on('yjs-update', (update) => Y.applyUpdate(ydoc, new Uint8Array(update)));
-
-    awareness.on('update', (changes: any, origin: any) => {
-      if (origin === socket) return; 
-      const update = encodeAwarenessUpdate(awareness, changes.added.concat(changes.updated, changes.removed));
-      socket.emit('awareness-update', { documentId, update: Array.from(update) });
-    });
-
-    socket.on('awareness-update', (update) => applyAwarenessUpdate(awareness, new Uint8Array(update), socket));
-
+    // --- Presence UI Updates ---
     awareness.on('change', () => {
       const entries = Array.from(awareness.getStates().entries());
       const validUsers = entries.filter(([, s]: any) => s.user && s.user.name);
       setActiveUsers(validUsers);
     });
 
+    // --- Initial Cold Storage Fetch ---
     fetch(`${API_URL}/documents/${documentId}`, { headers: { 'Authorization': `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => {
         setDocumentMeta({ title: data.title });
-        setMyRole(data.myRole); // STAGE 8: Save role from backend
+        setMyRole(data.myRole);
         if (data.content?.update) Y.applyUpdate(ydoc, new Uint8Array(data.content.update));
         setLoading(false);
-        setSyncStatus('saved');
       })
       .catch(() => router.push('/dashboard'));
 
-    socket.emit('join-document', documentId);
-
     return () => {
-      socket.disconnect();
+      provider.destroy();
       ydoc.destroy();
       awareness.destroy();
     };
@@ -296,14 +307,12 @@ export default function DocumentPage() {
               </div>
 
               <div className="flex items-center gap-4 shrink-0">
-                {/* STAGE 8: Read-Only Badge */}
                 {myRole === 'viewer' && (
                   <span className="font-mono text-[10px] uppercase tracking-[0.15em] px-2 py-1 rounded" style={{ backgroundColor: HAIRLINE, color: TAUPE }}>
                     Read-Only
                   </span>
                 )}
 
-                {/* STAGE 8: Share Button (Owner Only) */}
                 {myRole === 'owner' && (
                   <button onClick={() => setShowShareModal(true)} className="font-mono text-[10px] uppercase tracking-[0.15em] transition-colors hover:opacity-70" style={{ color: RUST }}>
                     Share
@@ -349,8 +358,7 @@ export default function DocumentPage() {
         <main className="max-w-3xl mx-auto mt-6 w-full px-4 sm:px-6">
           <div className="overflow-hidden" style={{ backgroundColor: PAPER_RAISED, border: `1px solid ${HAIRLINE}`, borderRadius: '2px', boxShadow: '0 1px 2px rgba(28,27,26,0.04), 0 8px 24px rgba(28,27,26,0.04)' }}>
             <div className="py-14 px-10 sm:px-20">
-              
-              {/* STAGE 8: Hide floating menus from viewers */}
+
               {editor && myRole !== 'viewer' && (
                 <>
                   <BubbleMenu editor={editor} options={{ offset: 8, placement: 'top' }} className="flex overflow-hidden z-50" style={{ backgroundColor: INK, borderRadius: '4px', boxShadow: '0 4px 14px rgba(0,0,0,0.25)' }}>
@@ -392,7 +400,7 @@ export default function DocumentPage() {
             <h2 className="text-sm font-bold" style={{ color: INK }}>Version History</h2>
             <button onClick={() => setShowHistory(false)} style={{ color: TAUPE }}>✕</button>
           </div>
-          
+
           {myRole !== 'viewer' && (
             <div className="p-4" style={{ borderBottom: `1px solid ${HAIRLINE}` }}>
               <button onClick={createSnapshot} className="w-full text-xs font-bold py-2 rounded shadow-sm transition" style={{ backgroundColor: INK, color: PAPER }}>
@@ -415,7 +423,7 @@ export default function DocumentPage() {
                   </div>
                   <div className="text-[10px] flex justify-between items-center" style={{ color: TAUPE }}>
                     <span>By {v.author_name || 'Owner'}</span>
-                    
+
                     {myRole !== 'viewer' && (
                       <button onClick={() => restoreVersion(v.id)} className="font-bold opacity-0 group-hover:opacity-100 transition" style={{ color: RUST }}>
                         Restore
@@ -429,7 +437,6 @@ export default function DocumentPage() {
         </div>
       )}
 
-      {/* STAGE 8: Share Modal */}
       {showShareModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/20 backdrop-blur-sm">
           <div className="w-full max-w-sm rounded p-6 shadow-2xl" style={{ backgroundColor: PAPER_RAISED, border: `1px solid ${HAIRLINE}` }}>
@@ -437,24 +444,24 @@ export default function DocumentPage() {
               <h3 className="font-serif font-semibold text-lg" style={{ color: INK }}>Invite Collaborator</h3>
               <button onClick={() => setShowShareModal(false)} style={{ color: TAUPE }}>✕</button>
             </div>
-            
+
             <form onSubmit={handleShare} className="space-y-4">
               <div>
                 <label className="block text-[11px] font-mono uppercase tracking-wider mb-1.5" style={{ color: TAUPE }}>Email Address</label>
-                <input 
-                  type="email" 
-                  required 
-                  value={shareEmail} 
+                <input
+                  type="email"
+                  required
+                  value={shareEmail}
                   onChange={e => setShareEmail(e.target.value)}
                   className="w-full px-3 py-2 text-sm outline-none focus:ring-1 transition"
                   style={{ backgroundColor: PAPER, border: `1px solid ${HAIRLINE}`, color: INK, outlineColor: RUST }}
                   placeholder="colleague@university.edu"
                 />
               </div>
-              
+
               <div>
                 <label className="block text-[11px] font-mono uppercase tracking-wider mb-1.5" style={{ color: TAUPE }}>Role</label>
-                <select 
+                <select
                   value={shareRole}
                   onChange={e => setShareRole(e.target.value as 'editor' | 'viewer')}
                   className="w-full px-3 py-2 text-sm outline-none focus:ring-1 transition cursor-pointer"
@@ -465,8 +472,8 @@ export default function DocumentPage() {
                 </select>
               </div>
 
-              <button 
-                type="submit" 
+              <button
+                type="submit"
                 className="w-full font-bold text-xs py-2.5 rounded mt-2 transition-opacity hover:opacity-90"
                 style={{ backgroundColor: INK, color: PAPER }}
               >
@@ -476,7 +483,6 @@ export default function DocumentPage() {
           </div>
         </div>
       )}
-
     </div>
   );
 }

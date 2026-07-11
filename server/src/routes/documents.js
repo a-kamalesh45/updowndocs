@@ -1,5 +1,5 @@
 import express from 'express';
-import { pool } from '../db.js'; 
+import { pool } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -16,10 +16,10 @@ router.post('/', requireAuth, async (req, res) => {
     await pool.query('BEGIN'); // Start transaction
     const docRes = await pool.query("INSERT INTO documents (title, owner_id) VALUES ('Untitled Document', $1) RETURNING *", [req.userId]);
     const doc = docRes.rows[0];
-    
+
     await pool.query('INSERT INTO collaborators (document_id, user_id, role) VALUES ($1, $2, $3)', [doc.id, req.userId, 'owner']);
     await pool.query('COMMIT');
-    
+
     res.status(201).json(doc);
   } catch (err) {
     await pool.query('ROLLBACK');
@@ -64,10 +64,16 @@ router.patch('/:id', requireAuth, async (req, res) => {
     // STAGE 8 ENFORCEMENT: Viewers cannot save to Postgres
     if (role !== 'owner' && role !== 'editor') return res.status(403).json({ error: 'Viewers cannot save' });
 
+    // Inside PATCH /:id
     const { title, content } = req.body;
-    if (content) await pool.query('UPDATE documents SET content = $1, updated_at = now() WHERE id = $2', [content, req.params.id]);
-    if (title) await pool.query('UPDATE documents SET title = $1, updated_at = now() WHERE id = $2', [title, req.params.id]);
-    
+    if (content) {
+      const binaryData = Buffer.from(content, 'base64');
+      await pool.query('UPDATE documents SET content = $1, updated_at = now() WHERE id = $2', [binaryData, req.params.id]);
+    }
+    if (title) {
+      await pool.query('UPDATE documents SET title = $1, updated_at = now() WHERE id = $2', [title, req.params.id]);
+    }
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -115,6 +121,14 @@ router.post('/:id/share', requireAuth, async (req, res) => {
        ON CONFLICT (document_id, user_id) DO UPDATE SET role = $3`,
       [req.params.id, targetUserId, role]
     );
+
+    // Inside POST /:id/share, after the INSERT query
+    const io = req.app.get('io');
+    io.to(req.params.id).emit('permissions-updated', {
+      userId: targetUserId,
+      newRole: role
+    });
+    
     res.json({ success: true });
   } catch (err) {
     console.error(err);
