@@ -123,11 +123,23 @@ router.post('/:id/share', requireAuth, async (req, res) => {
     );
 
     // Inside POST /:id/share, after the INSERT query
-    const io = req.app.get('io');
-    io.to(req.params.id).emit('permissions-updated', {
-      userId: targetUserId,
-      newRole: role
-    });
+    // ... inside router.post('/:id/share', ...) after successful DB update ...
+
+    const targetUserRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (targetUserRes.rows.length > 0) {
+      const targetUserId = targetUserRes.rows[0].id;
+      const io = req.app.get('io');
+      const sockets = await io.in(req.params.id).fetchSockets();
+      
+      // Actively hunt down the target user's open sockets and mutate their permissions
+      for (const s of sockets) {
+        if (s.userId === targetUserId) {
+          if (!s.roles) s.roles = {};
+          s.roles[req.params.id] = role; // Force mutate the backend cache
+          s.emit('permissions-updated', { newRole: role, userId: targetUserId });
+        }
+      }
+    }
     
     res.json({ success: true });
   } catch (err) {
@@ -174,6 +186,39 @@ router.post('/:id/versions', requireAuth, async (req, res) => {
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// NEW ROUTE: CRDT-Safe Snapshot Restoration
+router.post('/:id/versions/:versionId/restore', requireAuth, async (req, res) => {
+  try {
+    const role = await getRole(req.userId, req.params.id);
+    if (role !== 'owner' && role !== 'editor') {
+      return res.status(403).json({ error: 'Unauthorized to restore' });
+    }
+
+    // 1. Fetch the historical Base64 binary state
+    const version = await pool.query(
+      'SELECT content FROM versions WHERE id = $1 AND document_id = $2', 
+      [req.params.versionId, req.params.id]
+    );
+    
+    if (version.rows.length === 0) return res.status(404).json({ error: 'Version not found' });
+    
+    // 2. Overwrite the primary document state in the DB
+    await pool.query(
+      'UPDATE documents SET content = $1 WHERE id = $2', 
+      [version.rows[0].content, req.params.id]
+    );
+    
+    // 3. Broadcast the restoration event to all clients actively in the room
+    const io = req.app.get('io');
+    io.to(req.params.id).emit('document-restored', version.rows[0].content);
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to restore' });
+  }
 });
 
 export default router;

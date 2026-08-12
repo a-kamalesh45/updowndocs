@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 export default function AuthPage() {
@@ -7,6 +7,13 @@ export default function AuthPage() {
   const [formData, setFormData] = useState({ name: '', email: '', password: '' });
   const [error, setError] = useState('');
   const router = useRouter();
+
+  // Already signed in this session — don't make the user log in again.
+  useEffect(() => {
+    if (localStorage.getItem('token')) {
+      router.replace('/dashboard');
+    }
+  }, [router]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

@@ -57,8 +57,12 @@ io.use((socket, next) => {
   });
 });
 
+const rateLimits = new Map();
+
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.userId}`);
+
+  rateLimits.set(socket.id, { count: 0, lastReset: Date.now() });
 
   const expiryCheck = setInterval(() => {
     if (socket.tokenExp && Date.now() / 1000 > socket.tokenExp) {
@@ -91,11 +95,29 @@ io.on('connection', (socket) => {
   });
 
   socket.on('awareness-update', ({ documentId, update }) => {
+    const limit = rateLimits.get(socket.id);
+    const now = Date.now();
+    
+    // Reset counter every 1 second
+    if (now - limit.lastReset > 1000) { 
+      limit.count = 0; 
+      limit.lastReset = now; 
+    }
+    
+    limit.count++;
+    
+    // Disconnect malicious clients blasting > 30 updates per second
+    if (limit.count > 30) {
+      console.warn(`DDoS Prevented: Rate limit exceeded for socket ${socket.id}`);
+      return socket.disconnect(true);
+    }
+    
     socket.to(documentId).emit('awareness-update', update);
   });
 
   socket.on('disconnect', () => {
     clearInterval(expiryCheck);
+    rateLimits.delete(socket.id); // Clean up memory
   });
 });
 

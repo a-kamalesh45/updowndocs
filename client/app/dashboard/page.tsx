@@ -1,25 +1,66 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import Link from 'next/link';
+import { Plus } from 'lucide-react';
 
-interface Document {
-  id: string;
-  title: string;
-  updated_at: string;
-}
+import DocumentsHeader from '../components/documents/DocumentsHeader';
+import DocumentToolbar, { SortOption } from '../components/documents/DocumentToolbar';
+import DocumentGrid from '../components/documents/DocumentGrid';
+import { DocumentGridSkeleton } from '../components/documents/DocumentCardSkeleton';
+import EmptyDocuments from '../components/documents/EmptyDocuments';
+import ErrorState from '../components/documents/ErrorState';
+import CreateDocumentModal from '../components/documents/CreateDocumentModal';
+import DeleteConfirmModal from '../components/documents/DeleteConfirmModal';
+import { DocumentItem } from '../components/documents/DocumentCard';
+import { useToast } from '../components/ui/Toast';
 
 const API_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
 
+const UI_STATE_KEY = 'folio:documents:ui';
+const SCROLL_KEY = 'folio:documents:scroll';
+
+function readStoredUiState(): { query: string; sort: SortOption; view: 'grid' | 'list' } {
+  if (typeof window === 'undefined') return { query: '', sort: 'updated', view: 'grid' };
+  try {
+    const raw = sessionStorage.getItem(UI_STATE_KEY);
+    if (!raw) return { query: '', sort: 'updated', view: 'grid' };
+    const parsed = JSON.parse(raw);
+    return {
+      query: typeof parsed.query === 'string' ? parsed.query : '',
+      sort: parsed.sort === 'title' ? 'title' : 'updated',
+      view: parsed.view === 'list' ? 'list' : 'grid',
+    };
+  } catch {
+    return { query: '', sort: 'updated', view: 'grid' };
+  }
+}
+
 export default function DashboardPage() {
-  const [documents, setDocuments] = useState<Document[]>([]);
+  const { showToast } = useToast();
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(false);
+
+  const [user, setUser] = useState<{ name?: string; email?: string }>({});
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
+  const savingRenameRef = useRef<Set<string>>(new Set());
 
+  const initialUiState = useMemo(() => readStoredUiState(), []);
+  const [query, setQuery] = useState(initialUiState.query);
+  const [sort, setSort] = useState<SortOption>(initialUiState.sort);
+  const [view, setView] = useState<'grid' | 'list'>(initialUiState.view);
+
+  const [modalOpen, setModalOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+
+  const [deleteTarget, setDeleteTarget] = useState<DocumentItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
+
+  const scrollRestoredRef = useRef(false);
   const router = useRouter();
 
   const fetchDocuments = async () => {
@@ -30,73 +71,172 @@ export default function DashboardPage() {
       return;
     }
 
+    setLoading(true);
+    setError(false);
+
     try {
       const res = await fetch(`${API_URL}/documents`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
       });
 
       if (res.status === 401) throw new Error('Unauthorized');
+      if (!res.ok) throw new Error('Request failed');
 
       const data = await res.json();
       setDocuments(data);
     } catch (err) {
-      localStorage.removeItem('token');
-      router.push('/auth');
+      if (err instanceof Error && err.message === 'Unauthorized') {
+        localStorage.removeItem('token');
+        router.push('/auth');
+        return;
+      }
+      setError(true);
     } finally {
       setLoading(false);
     }
   };
 
+  const fetchUser = async () => {
+    const token = localStorage.getItem('token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`${API_URL}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setUser({ name: data.user?.name, email: data.user?.email });
+      }
+    } catch {
+      // Non-critical — the workspace still functions without profile info.
+    }
+  };
+
   useEffect(() => {
     fetchDocuments();
+    fetchUser();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const createDocument = async () => {
+  // Persist list UI state (search/sort/view) so returning from a document feels continuous.
+  useEffect(() => {
+    sessionStorage.setItem(UI_STATE_KEY, JSON.stringify({ query, sort, view }));
+  }, [query, sort, view]);
+
+  // Restore scroll position once the real content has painted.
+  useEffect(() => {
+    if (loading || scrollRestoredRef.current) return;
+    scrollRestoredRef.current = true;
+    const saved = sessionStorage.getItem(SCROLL_KEY);
+    if (saved) {
+      requestAnimationFrame(() => window.scrollTo(0, parseInt(saved, 10) || 0));
+    }
+  }, [loading]);
+
+  // Capture scroll position right before this page unmounts (e.g. opening a document).
+  useEffect(() => {
+    return () => {
+      sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
+    };
+  }, []);
+
+  // Cmd/Ctrl+K focuses search, matching the shortcut hinted in the search field.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        document.getElementById('document-search-input')?.focus();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  const createDocument = async (title: string) => {
     const token = localStorage.getItem('token');
+    setCreating(true);
 
     try {
       const res = await fetch(`${API_URL}/documents`, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
       });
 
       if (!res.ok) throw new Error();
 
       const newDoc = await res.json();
 
+      if (title) {
+        await fetch(`${API_URL}/documents/${newDoc.id}`, {
+          method: 'PATCH',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ title }),
+        });
+      }
+
       router.push(`/documents/${newDoc.id}`);
     } catch (err) {
-      setError('Failed to create document');
+      setCreating(false);
+      setModalOpen(false);
+      showToast('Failed to create document.', 'error');
     }
   };
 
-  const deleteDocument = async (id: string) => {
-    if (!confirm('Are you sure you want to delete this document?')) return;
+  const requestDelete = (doc: DocumentItem) => {
+    setDeleteError('');
+    setDeleteTarget(doc);
+  };
 
+  const cancelDelete = () => {
+    if (deleting) return;
+    setDeleteTarget(null);
+    setDeleteError('');
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
     const token = localStorage.getItem('token');
 
+    setDeleting(true);
+    setDeleteError('');
+
     try {
-      const res = await fetch(`${API_URL}/documents/${id}`, {
+      const res = await fetch(`${API_URL}/documents/${deleteTarget.id}`, {
         method: 'DELETE',
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
       });
 
       if (!res.ok) throw new Error();
 
-      setDocuments(documents.filter(doc => doc.id !== id));
+      setDocuments((docs) => docs.filter((doc) => doc.id !== deleteTarget.id));
+      setDeleteTarget(null);
+      showToast('Document deleted', 'success');
     } catch (err) {
-      setError('Failed to delete document');
+      setDeleteError("Couldn't delete document. Please try again.");
+    } finally {
+      setDeleting(false);
     }
   };
 
+  const startRename = (doc: DocumentItem) => {
+    setEditingId(doc.id);
+    setEditTitle(doc.title);
+  };
+
   const saveRename = async (id: string) => {
+    if (savingRenameRef.current.has(id)) return;
+
+    if (!editTitle.trim()) {
+      setEditingId(null);
+      return;
+    }
+
     const token = localStorage.getItem('token');
+    savingRenameRef.current.add(id);
 
     try {
       const res = await fetch(`${API_URL}/documents/${id}`, {
@@ -105,159 +245,130 @@ export default function DashboardPage() {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          title: editTitle,
-        }),
+        body: JSON.stringify({ title: editTitle }),
       });
 
       if (!res.ok) throw new Error();
 
       const updatedDoc = await res.json();
 
-      setDocuments(
-        documents.map(doc =>
-          doc.id === id
-            ? { ...doc, title: updatedDoc.title }
-            : doc
+      setDocuments((docs) =>
+        docs.map((doc) =>
+          doc.id === id ? { ...doc, title: updatedDoc.title ?? editTitle } : doc
         )
       );
-
-      setEditingId(null);
+      showToast('Document renamed', 'success');
     } catch (err) {
-      setError('Failed to rename document');
+      showToast('Failed to rename document.', 'error');
+    } finally {
+      savingRenameRef.current.delete(id);
+      setEditingId(null);
     }
   };
 
   const handleLogout = () => {
     localStorage.removeItem('token');
+    sessionStorage.removeItem(UI_STATE_KEY);
+    sessionStorage.removeItem(SCROLL_KEY);
     router.push('/auth');
   };
 
-  if (loading) {
-    return (
-      <div className="p-8 font-mono">
-        Initializing systems...
-      </div>
-    );
-  }
+  const visibleDocuments = useMemo(() => {
+    let list = documents;
+
+    if (query.trim()) {
+      const q = query.trim().toLowerCase();
+      list = list.filter((doc) => doc.title.toLowerCase().includes(q));
+    }
+
+    list = [...list].sort((a, b) => {
+      if (sort === 'title') return a.title.localeCompare(b.title);
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    });
+
+    return list;
+  }, [documents, query, sort]);
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 p-8">
-      <div className="max-w-5xl mx-auto">
+    <div className="min-h-screen bg-paper">
+      <DocumentsHeader name={user.name} email={user.email} onLogout={handleLogout} />
 
-        {/* Header */}
-        <div className="flex justify-between items-center mb-10 pb-4 border-b border-gray-200">
-          <h1 className="text-3xl font-semibold tracking-tight">
-            Documents
-          </h1>
-
-          <div className="flex gap-4">
-            <button
-              onClick={createDocument}
-              className="bg-black text-white px-5 py-2 text-sm font-medium rounded-sm hover:bg-gray-800 transition shadow-sm"
-            >
-              + New Document
-            </button>
-
-            <button
-              onClick={handleLogout}
-              className="text-gray-500 hover:text-black text-sm transition px-3"
-            >
-              Logout
-            </button>
+      <main className="mx-auto max-w-[1400px] px-6 py-10 sm:px-10 lg:px-16">
+        <div className="flex flex-col gap-4 pb-8 border-b border-hairline sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h1 className="font-serif text-3xl tracking-tight text-ink sm:text-4xl">
+              Documents
+            </h1>
+            <p className="mt-2 text-[14px] text-taupe">
+              Your workspace for everything you&apos;re writing together.
+            </p>
           </div>
+
+          <button
+            onClick={() => setModalOpen(true)}
+            className="group inline-flex w-fit items-center gap-2 rounded-[6px] bg-ink px-5 py-2.5 text-[13px] font-medium text-paper transition-all duration-200 hover:-translate-y-0.5 hover:bg-[#33312e]"
+          >
+            <Plus size={15} strokeWidth={2.25} />
+            New Document
+          </button>
         </div>
 
-        {error && (
-          <div className="bg-red-50 text-red-600 p-3 mb-6 rounded text-sm">
-            {error}
-          </div>
-        )}
+        <div className="mt-8">
+          {!loading && !error && documents.length > 0 && (
+            <div className="mb-6">
+              <DocumentToolbar
+                query={query}
+                onQueryChange={setQuery}
+                sort={sort}
+                onSortChange={setSort}
+                view={view}
+                onViewChange={setView}
+              />
+            </div>
+          )}
 
-        {documents.length === 0 ? (
-          <div className="text-center py-20 bg-white border border-dashed border-gray-300 rounded-sm">
-            <p className="text-gray-500 mb-4">
-              No documents found.
-            </p>
+          {loading ? (
+            <DocumentGridSkeleton />
+          ) : error ? (
+            <ErrorState onRetry={fetchDocuments} />
+          ) : documents.length === 0 ? (
+            <EmptyDocuments onCreate={() => setModalOpen(true)} />
+          ) : visibleDocuments.length === 0 ? (
+            <EmptyDocuments onCreate={() => setModalOpen(true)} filtered />
+          ) : (
+            <DocumentGrid
+              documents={visibleDocuments}
+              view={view}
+              editingId={editingId}
+              editValue={editTitle}
+              onEditValueChange={setEditTitle}
+              onStartRename={startRename}
+              onSubmitRename={saveRename}
+              onCancelRename={() => setEditingId(null)}
+              onRequestDelete={requestDelete}
+            />
+          )}
+        </div>
+      </main>
 
-            <button
-              onClick={createDocument}
-              className="text-blue-600 hover:underline"
-            >
-              Create your first document
-            </button>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {documents.map((doc) => (
-              <div
-                key={doc.id}
-                className="bg-white p-5 border border-gray-200 rounded-sm shadow-sm hover:shadow-md transition group flex flex-col justify-between h-40"
-              >
+      <CreateDocumentModal
+        open={modalOpen}
+        creating={creating}
+        onClose={() => {
+          setModalOpen(false);
+          setCreating(false);
+        }}
+        onCreate={createDocument}
+      />
 
-                {/* Title */}
-                <div>
-                  {editingId === doc.id ? (
-                    <input
-                      type="text"
-                      value={editTitle}
-                      autoFocus
-                      className="w-full border-b border-black outline-none font-medium mb-2 pb-1"
-                      onChange={(e) =>
-                        setEditTitle(e.target.value)
-                      }
-                      onBlur={() => saveRename(doc.id)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          saveRename(doc.id);
-                        }
-                      }}
-                    />
-                  ) : (
-                    <div className="flex justify-between items-start mb-2">
-                      <Link
-                        href={`/documents/${doc.id}`}
-                        className="font-medium hover:text-blue-600 truncate pr-4"
-                      >
-                        {doc.title}
-                      </Link>
-                    </div>
-                  )}
-
-                  <p className="text-xs text-gray-400 font-mono">
-                    Updated:{' '}
-                    {new Date(
-                      doc.updated_at
-                    ).toLocaleDateString()}
-                  </p>
-                </div>
-
-                {/* Actions */}
-                <div className="flex justify-between items-center pt-4 border-t border-gray-100 opacity-0 group-hover:opacity-100 transition">
-                  <button
-                    onClick={() => {
-                      setEditingId(doc.id);
-                      setEditTitle(doc.title);
-                    }}
-                    className="text-xs text-gray-500 hover:text-black"
-                  >
-                    Rename
-                  </button>
-
-                  <button
-                    onClick={() => deleteDocument(doc.id)}
-                    className="text-xs text-red-400 hover:text-red-600"
-                  >
-                    Delete
-                  </button>
-                </div>
-
-              </div>
-            ))}
-          </div>
-        )}
-
-      </div>
+      <DeleteConfirmModal
+        open={!!deleteTarget}
+        title={deleteTarget?.title ?? ''}
+        deleting={deleting}
+        error={deleteError}
+        onCancel={cancelDelete}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }
